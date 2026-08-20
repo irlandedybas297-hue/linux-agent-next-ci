@@ -1,0 +1,107 @@
+name: linux-private-branch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Clone private test branch
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          git -c http.extraheader="Authorization: Bearer ${SOURCE_REPO_TOKEN}" \
+            clone --depth 1 --branch codex/linux-agent-next-ci \
+            https://github.com/irlandedybas297-hue/win-agent.git private
+          git -C private rev-parse HEAD
+
+      - name: Set up Rust 1.97.1
+        uses: dtolnay/rust-toolchain@6f7ec2e25b958742591cff7f1bee758884983879 # pinned action
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485082b9dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.16.0
+
+      - name: Install Linux fixtures
+        run: sudo apt-get update && sudo apt-get install -y cpio file musl-tools
+
+      - name: Format
+        working-directory: private/linux-agent-next
+        run: cargo +1.97.1 fmt --all -- --check
+
+      - name: Unit tests
+        working-directory: private/linux-agent-next
+        run: cargo +1.97.1 test --locked --workspace --all-features
+
+      - name: Clippy
+        working-directory: private/linux-agent-next
+        run: cargo +1.97.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Boundary and ABI gates
+        working-directory: private/linux-agent-next
+        run: |
+          ./tools/check-boundary.sh
+          ./tools/check-abi.sh
+          ./tools/check-configured-build.sh
+          ./tools/check-capability-parity.sh
+
+      - name: Build and measure profiles
+        working-directory: private/linux-agent-next
+        run: ./tools/size-report.sh
+
+      - name: Static artifact and idle resource gates
+        working-directory: private/linux-agent-next
+        run: |
+          set -euo pipefail
+          binary=target/size-report/default/x86_64-unknown-linux-musl/minimal/linux-agent-bin
+          hardened=target/size-report/hardened/x86_64-unknown-linux-musl/minimal/linux-agent-bin
+          file "$binary" "$hardened"
+          ! readelf -l "$binary" | grep -q INTERP
+          ./tools/check-static-surface.sh "$binary"
+          MAX_RSS_KIB=32768 MAX_FDS=32 MAX_THREADS=1 ./tools/linux-runtime-smoke.sh "$binary" 2
+          MAX_RSS_KIB=32768 MAX_FDS=32 MAX_THREADS=2 ./tools/linux-runtime-smoke.sh "$hardened" 2
+
+      - name: Go control-plane integration, glibc
+        working-directory: private
+        env:
+          WADDLE_LINUX_AGENT_NEXT: '1'
+          WADDLE_LINUX_AGENT_NEXT_TARGET: x86_64-unknown-linux-gnu
+          WADDLE_LINUX_AGENT_NEXT_FEATURES: minimal,diagnostics
+        run: go test ./integration/rustagent -run '^TestLinuxAgentNextAgainstGoServer$' -count=1 -v
+
+      - name: Go control-plane integration, musl
+        working-directory: private
+        env:
+          WADDLE_LINUX_AGENT_NEXT: '1'
+          WADDLE_LINUX_AGENT_NEXT_TARGET: x86_64-unknown-linux-musl
+          WADDLE_LINUX_AGENT_NEXT_FEATURES: minimal,diagnostics
+        run: go test ./integration/rustagent -run '^TestLinuxAgentNextAgainstGoServer$' -count=1 -v
+
+      - name: Go control-plane integration, production feature surface
+        working-directory: private
+        env:
+          WADDLE_LINUX_AGENT_NEXT: '1'
+          WADDLE_LINUX_AGENT_NEXT_TARGET: x86_64-unknown-linux-musl
+          WADDLE_LINUX_AGENT_NEXT_FEATURES: production,diagnostics
+        run: go test ./integration/rustagent -run '^TestLinuxAgentNextAgainstGoServer$' -count=1 -v
